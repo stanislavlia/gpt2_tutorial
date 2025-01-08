@@ -155,7 +155,7 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
 
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
 
         B, T = idx.size()
 
@@ -177,8 +177,11 @@ class GPT(nn.Module):
         #final layer
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x) #(B, T, vocab_size)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1),), targets.view(-1))
 
-        return logits
+        return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -230,63 +233,97 @@ class GPT(nn.Module):
         return model
 
         
-        
-
-
-#===========================GENERATE=====================================
-
-num_return_sequences = 5
-max_length = 30
-
-model = GPT.from_pretrained("gpt2")
-model.eval()
-
-
-model.to("cuda")
-
-
-#prefix tokens 
 
 import tiktoken
 
+device = "cuda"
+
 enc = tiktoken.get_encoding("gpt2")
+with open("input.txt", "r") as f:
+    text = f.read()
 
-tokens = enc.encode("Hello, I am a language model, ")
-tokens = torch.tensor(tokens, dtype=torch.long) #(8, )
+text =  text[:1000]
+tokens = enc.encode(text)
 
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) #(5, 8)
+B, T = 4, 32
 
-x = tokens.to("cuda")
+buf = torch.tensor(tokens[: B*T + 1])
+buf = buf.to(device)
+x = buf[:-1].view(B, T)
+y = buf[1:].view(B, T)
 
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
+model = GPT(GPTConfig())
+model.to(device)
 
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-5)
+ 
+for i in range(50):
 
-while x.size(1) < max_length:
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
 
+    optimizer.step()
 
-    with torch.no_grad():
-        logits = model(x)
-
-        logits = logits[:, -1, :] #(B, vocab_size)
-        probs = F.softmax(logits, dim=-1)
-
-        #sampling
-        topk_probs,  topk_indices  = torch.topk(probs, 50, dim=-1) #Sample only from top 50 most likely tokens
-
-        ix = torch.multinomial(topk_probs, 1)
-
-        #gather indices 
-        xcol = torch.gather(topk_indices, -1, ix) #col of new tokens
-
-        #append to sequence
-        x = torch.cat((x, xcol), dim=1)
+    print(f"#{i} LOSS: {loss}")
+         
 
 
-#print 
+# #===========================GENERATE=====================================
 
-for i in range(num_return_sequences):
+# num_return_sequences = 3
+# max_length = 50
 
-    tokens = x[i, :max_length].tolist()
-    decoded = enc.decode(tokens)
-    print(">>>", decoded)
+# #model = GPT.from_pretrained("gpt2")
+# model = GPT(GPTConfig())
+# model.eval()
+
+
+# model.to("cuda")
+
+
+# #prefix tokens 
+
+# import tiktoken
+
+# enc = tiktoken.get_encoding("gpt2")
+
+# tokens = enc.encode("Hello, I'm a language model,")
+# tokens = torch.tensor(tokens, dtype=torch.long) #(8, )
+
+# tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) #(5, 8)
+
+# x = tokens.to("cuda")
+
+# torch.manual_seed(42)
+# torch.cuda.manual_seed(42)
+
+
+# while x.size(1) < max_length:
+
+
+#     with torch.no_grad():
+#         logits = model(x)
+
+#         logits = logits[:, -1, :] #(B, vocab_size)
+#         probs = F.softmax(logits, dim=-1)
+
+#         #sampling
+#         topk_probs,  topk_indices  = torch.topk(probs, 50, dim=-1) #Sample only from top 50 most likely tokens
+
+#         ix = torch.multinomial(topk_probs, 1)
+
+#         #gather indices 
+#         xcol = torch.gather(topk_indices, -1, ix) #col of new tokens
+
+#         #append to sequence
+#         x = torch.cat((x, xcol), dim=1)
+
+
+# #print 
+
+# for i in range(num_return_sequences):
+
+#     tokens = x[i, :max_length].tolist()
+#     decoded = enc.decode(tokens)
+#     print(">>>", decoded)
