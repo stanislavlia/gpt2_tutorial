@@ -83,7 +83,12 @@ class MLP(nn.Module):
         self.gelu = nn.GELU(approximate="tanh")
         self.c_proj = nn.Linear(config.n_embd * 4, config.n_embd)
 
-
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        return x
+    
 class Block(nn.Module):
 
     def __init__(self, config):
@@ -123,7 +128,7 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(
             dict(wte=nn.Embedding(config.vocab_size, config.n_embd), # embedding lookup for tokens
-                 wpe=nn.Embedding(config.block_size, config.n_embd), #positional embeddings 
+                 wpe=nn.Embedding(config.block_size, config.n_embd), # positional embeddings 
                  h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
                  ln_f=nn.LayerNorm(config.n_embd)
                                   )
@@ -149,6 +154,31 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+
+    def forward(self, idx):
+
+        B, T = idx.size()
+
+        assert T <= self.config.block_size, "Cannot forward sequence bigger than block size"
+
+        #forward token and pos embeddings
+
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
+        pos_emb = self.transformer.wpe(pos) #position embeddings of shape (T, n_embd)
+        tok_emb = self.transformer.wte(idx) #token embeddings of shape (B, T, n_embd)
+
+        x = tok_emb + pos_emb 
+
+        #forward blocks
+        for block in self.transformer.h:
+
+            x = block(x)
+
+        #final layer
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x) #(B, T, vocab_size)
+
+        return logits
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -203,6 +233,60 @@ class GPT(nn.Module):
         
 
 
+#===========================GENERATE=====================================
+
+num_return_sequences = 5
+max_length = 30
 
 model = GPT.from_pretrained("gpt2")
-print("success")
+model.eval()
+
+
+model.to("cuda")
+
+
+#prefix tokens 
+
+import tiktoken
+
+enc = tiktoken.get_encoding("gpt2")
+
+tokens = enc.encode("Hello, I am a language model, ")
+tokens = torch.tensor(tokens, dtype=torch.long) #(8, )
+
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) #(5, 8)
+
+x = tokens.to("cuda")
+
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+
+
+while x.size(1) < max_length:
+
+
+    with torch.no_grad():
+        logits = model(x)
+
+        logits = logits[:, -1, :] #(B, vocab_size)
+        probs = F.softmax(logits, dim=-1)
+
+        #sampling
+        topk_probs,  topk_indices  = torch.topk(probs, 50, dim=-1) #Sample only from top 50 most likely tokens
+
+        ix = torch.multinomial(topk_probs, 1)
+
+        #gather indices 
+        xcol = torch.gather(topk_indices, -1, ix) #col of new tokens
+
+        #append to sequence
+        x = torch.cat((x, xcol), dim=1)
+
+
+#print 
+
+for i in range(num_return_sequences):
+
+    tokens = x[i, :max_length].tolist()
+    decoded = enc.decode(tokens)
+    print(">>>", decoded)
