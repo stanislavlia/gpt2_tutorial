@@ -3,6 +3,10 @@ import torch.nn as nn
 import torch
 from torch.nn import functional as F
 
+import tiktoken
+import time
+
+
 
 
 
@@ -136,7 +140,7 @@ class GPT(nn.Module):
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False) #embedding -> next token
 
-        # weight sharing scheme
+        # weight sharing scheme (save about 30% of space)
         self.transformer.wte.weight = self.lm_head.weight
 
         # init params
@@ -147,7 +151,7 @@ class GPT(nn.Module):
         if isinstance(module, nn.Linear):
             std = 0.02
             if hasattr(module, 'NANOGPT_SCALE_INIT'):
-                std *= (2 * self.config.n_layer) ** -0.5
+                std *= (2 * self.config.n_layer) ** -0.5 #control variance to be 1 when we add (residual connections)
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
@@ -234,38 +238,83 @@ class GPT(nn.Module):
 
         
 
-import tiktoken
+
+class DataLoaderLite():
+    def __init__(self, B, T):
+
+        self.T = T
+        self.B = B
+
+        
+        enc = tiktoken.get_encoding("gpt2")
+        with open("input.txt", "r") as f:
+            text = f.read()
+
+        self.tokens = enc.encode(text)
+        print(f"Loaded  {len(self.tokens)} tokens")
+
+        self.batches = len(self.tokens) // (B*T)
+
+        #state 
+        self.curr_position = 0
+
+
+    def next_batch(self):
+
+        B, T = self.B, self.T
+
+        buf = torch.tensor(self.tokens[self.curr_position: self.curr_position + (B*T + 1)])
+
+        buf = buf.to("cuda")
+
+        x = buf[:-1].view(B, T) #inputs
+        y = buf[1:].view(B, T) #targets
+
+        #advance position in the tensor
+        self.curr_position += B*T
+
+        if self.curr_position + B*T >= len(self.tokens):
+            print("EPOCH COMPLETED")
+            #reset curr position to 0
+            self.curr_position = 0
+        
+        return x, y
+
+
+torch.set_float32_matmul_precision("high") #use TF32 for matrix multiplication
+
+
 
 device = "cuda"
 
-enc = tiktoken.get_encoding("gpt2")
-with open("input.txt", "r") as f:
-    text = f.read()
-
-text =  text[:1000]
-tokens = enc.encode(text)
-
-B, T = 4, 32
-
-buf = torch.tensor(tokens[: B*T + 1])
-buf = buf.to(device)
-x = buf[:-1].view(B, T)
-y = buf[1:].view(B, T)
+data_loader = DataLoaderLite(2, 1024)
 
 model = GPT(GPTConfig())
-model.to(device)
+model = model.to(device)
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-5)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
  
-for i in range(50):
 
-    optimizer.zero_grad()
-    logits, loss = model(x, y)
-    loss.backward()
+print("Number of batches: ", data_loader.batches)
 
-    optimizer.step()
+for i in range(2):
+    for batch in range(data_loader.batches):
 
-    print(f"#{i} LOSS: {loss}")
+        start_time = time.time()
+        optimizer.zero_grad()
+        x, y = data_loader.next_batch()
+        
+        with torch.autocast(device_type=device, dtype=torch.bfloat16): #use BFLOAT16 type (reduces mantissa, keeps exponent the same, tradeoff precision vs performance)
+            logits, loss = model(x, y) #activations and logits in lower precision, but model still in TF32  
+
+        loss.backward()
+
+        optimizer.step()
+        torch.cuda.synchronize()
+        end_time = time.time()
+        dt = (end_time - start_time) * 1000
+        tokens_per_sec = ((data_loader.B * data_loader.T) / (end_time - start_time))
+        print(f"BATCH# {batch} LOSS: {loss}; tokens per sec : {tokens_per_sec:.2f}")
          
 
 
